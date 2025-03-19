@@ -1,0 +1,9 @@
+Package: vcam.teste
+Name: VCamTeste
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: VCamTeste
+Maintainer: teste
+Author: teste
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
