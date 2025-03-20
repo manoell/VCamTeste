@@ -294,9 +294,10 @@ static NSString *const g_videoFile = @"/tmp/default.mp4";
                 }
                 break;
             default:
-                vcam_logf(@"Formato não reconhecido (%d), usando 32BGRA como padrão", (int)subMediaType);
-                if (videoTrackout_32BGRA_Buffer) {
-                    CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_32BGRA_Buffer, &newsampleBuffer);
+                //vcam_logf(@"Formato não reconhecido (%d), usando 32BGRA como padrão", (int)subMediaType);
+                vcam_logf(@"Formato não reconhecido (%d), usando 420F como padrão", (int)subMediaType);
+                if (videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer) {
+                    CMSampleBufferCreateCopy(kCFAllocatorDefault, videoTrackout_420YpCbCr8BiPlanarFullRange_Buffer, &newsampleBuffer);
                 }
         }
         
