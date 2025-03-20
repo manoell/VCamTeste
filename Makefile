@@ -7,7 +7,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCamTeste
 
-TTtest_FILES = Tweak.x
-TTtest_CFLAGS = -fobjc-arc -Werror -Wdeprecated-declarations
+VCamTeste_FILES = Tweak.x
+VCamTeste_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 include $(THEOS_MAKE_PATH)/tweak.mk
