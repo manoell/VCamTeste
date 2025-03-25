@@ -62,6 +62,7 @@ static void vcam_logf(NSString *format, ...) {
 @property (nonatomic, assign) BOOL enabled;
 @property (nonatomic, assign) int frameRate;
 @property (nonatomic, assign) BOOL showIndicator;
+@property (nonatomic, assign) BOOL transparentMode;
 
 + (instancetype)sharedConfig;
 - (void)saveConfig;
@@ -90,6 +91,7 @@ static void vcam_logf(NSString *format, ...) {
         _enabled = NO;
         _frameRate = 30;
         _showIndicator = YES;
+        _transparentMode = NO;
         
         // Configuration file path
         NSString *configDir = @"/var/mobile/Library/Preferences";
@@ -106,7 +108,8 @@ static void vcam_logf(NSString *format, ...) {
     NSDictionary *configDict = @{
         @"enabled": @(self.enabled),
         @"frameRate": @(self.frameRate),
-        @"showIndicator": @(self.showIndicator)
+        @"showIndicator": @(self.showIndicator),
+        @"transparentMode": @(self.transparentMode)
     };
     
     // Save to file
@@ -128,6 +131,7 @@ static void vcam_logf(NSString *format, ...) {
             _enabled = [configDict[@"enabled"] boolValue];
             _frameRate = [configDict[@"frameRate"] intValue] ?: 30;
             _showIndicator = [configDict[@"showIndicator"] boolValue];
+            _transparentMode = [configDict[@"transparentMode"] boolValue];
             
             vcam_log(@"Configuration loaded successfully");
         } else {
@@ -699,15 +703,27 @@ static CALayer *g_maskLayer = nil;
     
     // Control layer visibility based on video file existence
     if (fileExists && config.enabled) {
-        // Set black mask to fully opaque immediately
+        // Define opacidade da máscara preta baseado no modo
         if (g_maskLayer != nil) {
-            g_maskLayer.opacity = 1.0; // Instantaneously opaque
+            if (config.transparentMode) {
+                g_maskLayer.opacity = 0.0; // Transparente no modo transparente
+            } else {
+                g_maskLayer.opacity = 1.0; // Opaca no modo normal
+            }
         }
         
-        // Fade in the video layer gradually for smooth transition
+        // Define opacidade da camada de vídeo baseado no modo
         if (g_previewLayer != nil) {
-            if (g_previewLayer.opacity < 1.0) {
-                g_previewLayer.opacity = MIN(g_previewLayer.opacity + 0.1, 1.0);
+            if (config.transparentMode) {
+                // No modo transparente, o vídeo é parcialmente transparente
+                if (g_previewLayer.opacity < 0.5) {
+                    g_previewLayer.opacity = MIN(g_previewLayer.opacity + 0.1, 0.5);
+                }
+            } else {
+                // No modo normal, o vídeo é totalmente opaco
+                if (g_previewLayer.opacity < 1.0) {
+                    g_previewLayer.opacity = MIN(g_previewLayer.opacity + 0.1, 1.0);
+                }
             }
             [g_previewLayer setVideoGravity:[self videoGravity]];
         }
@@ -979,6 +995,35 @@ static NSTimeInterval g_last_toggle_time = 0;
                 }
             }];
         [alertController addAction:toggleAction];
+        
+        UIAlertAction *overlayAction = [UIAlertAction
+            actionWithTitle:config.transparentMode ? @"Modo Normal" : @"Modo Transparente"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+                // Toggle entre modo normal e transparente
+                config.transparentMode = !config.transparentMode;
+                [config saveConfig];
+                
+                NSString *modeMessage = config.transparentMode ?
+                    @"Modo transparente ativado. A câmera real ficará visível sob o vídeo." :
+                    @"Modo normal ativado. O vídeo substituirá completamente a câmera.";
+                
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIAlertController *confirmAlert = [UIAlertController
+                        alertControllerWithTitle:@"Modo Alterado"
+                        message:modeMessage
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    
+                    UIAlertAction *okAction = [UIAlertAction
+                        actionWithTitle:@"OK"
+                        style:UIAlertActionStyleDefault
+                        handler:nil];
+                    
+                    [confirmAlert addAction:okAction];
+                    [[GetFrame getKeyWindow].rootViewController presentViewController:confirmAlert animated:YES completion:nil];
+                });
+            }];
+        [alertController addAction:overlayAction];
         
         // Opção para alterar taxa de frames
         UIAlertAction *framerateAction = [UIAlertAction
