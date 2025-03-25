@@ -55,6 +55,98 @@ static void vcam_logf(NSString *format, ...) {
 }
 // -------------------- FIM DO SISTEMA DE LOG --------------------
 
+// -------------------- CONFIGURATION SYSTEM --------------------
+// Configuration class to manage settings with persistence
+@interface VCamConfig : NSObject
+@property (nonatomic, readonly) NSString *videoFile;
+@property (nonatomic, assign) BOOL enabled;
+@property (nonatomic, assign) int frameRate;
+@property (nonatomic, assign) BOOL showIndicator;
+
++ (instancetype)sharedConfig;
+- (void)saveConfig;
+- (void)loadConfig;
+- (BOOL)toggleEnabled;
+@end
+
+@implementation VCamConfig {
+    NSString *_configPath;
+}
+
++ (instancetype)sharedConfig {
+    static VCamConfig *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[self alloc] init];
+    });
+    return instance;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // Default settings
+        _videoFile = @"/tmp/default.mp4";
+        _enabled = NO;
+        _frameRate = 30;
+        _showIndicator = YES;
+        
+        // Configuration file path
+        NSString *configDir = @"/var/mobile/Library/Preferences";
+        _configPath = [configDir stringByAppendingPathComponent:@"com.vcam.config.plist"];
+        
+        // Load saved configuration
+        [self loadConfig];
+    }
+    return self;
+}
+
+- (void)saveConfig {
+    // Create a dictionary with configuration values
+    NSDictionary *configDict = @{
+        @"enabled": @(self.enabled),
+        @"frameRate": @(self.frameRate),
+        @"showIndicator": @(self.showIndicator)
+    };
+    
+    // Save to file
+    BOOL success = [configDict writeToFile:_configPath atomically:YES];
+    if (!success) {
+        vcam_log(@"Failed to save configuration");
+    } else {
+        vcam_log(@"Configuration saved successfully");
+    }
+}
+
+- (void)loadConfig {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    
+    if ([fileManager fileExistsAtPath:_configPath]) {
+        NSDictionary *configDict = [NSDictionary dictionaryWithContentsOfFile:_configPath];
+        
+        if (configDict) {
+            _enabled = [configDict[@"enabled"] boolValue];
+            _frameRate = [configDict[@"frameRate"] intValue] ?: 30;
+            _showIndicator = [configDict[@"showIndicator"] boolValue];
+            
+            vcam_log(@"Configuration loaded successfully");
+        } else {
+            vcam_log(@"Failed to load configuration");
+        }
+    } else {
+        vcam_log(@"No configuration file found, using defaults");
+        [self saveConfig]; // Create default config
+    }
+}
+
+- (BOOL)toggleEnabled {
+    _enabled = !_enabled;
+    [self saveConfig];
+    return _enabled;
+}
+@end
+// -------------------- END OF CONFIGURATION SYSTEM --------------------
+
 // Variáveis globais para gerenciamento de recursos
 static NSFileManager *g_fileManager = nil;                 // Objeto para gerenciamento de arquivos
 static BOOL g_canReleaseBuffer = YES;                      // Flag que indica se o buffer pode ser liberado
@@ -65,14 +157,13 @@ static BOOL g_cameraRunning = NO;                          // Flag que indica se
 static NSString *g_cameraPosition = @"B";                  // Posição da câmera: "B" (traseira) ou "F" (frontal)
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait; // Orientação do vídeo/foto
 static AVCaptureVideoOrientation g_lastOrientation = AVCaptureVideoOrientationPortrait; // Última orientação para otimização
-
-// Caminho do arquivo de vídeo padrão
-static NSString *const g_videoFile = @"/tmp/default.mp4";
+static UIView *g_indicatorView = nil;                      // Status indicator view
 
 // Classe para obtenção e manipulação de frames de vídeo
 @interface GetFrame : NSObject
 + (instancetype)sharedInstance;
 - (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef _Nullable)originSampleBuffer forceReNew:(BOOL)forceReNew;
+- (void)releaseResources;
 + (UIWindow*)getKeyWindow;
 @end
 
@@ -131,15 +222,15 @@ static NSString *const g_videoFile = @"/tmp/default.mp4";
 - (BOOL)setupVideoReader {
     @try {
         // Verificamos se existe um arquivo de vídeo para substituição
-        if (![g_fileManager fileExistsAtPath:g_videoFile]) {
+        if (![g_fileManager fileExistsAtPath:[VCamConfig sharedConfig].videoFile]) {
             vcam_log(@"Arquivo de vídeo para substituição não encontrado");
             return NO;
         }
         
         // Criamos um AVAsset a partir do arquivo de vídeo
-        NSURL *videoURL = [NSURL fileURLWithPath:g_videoFile];
+        NSURL *videoURL = [NSURL fileURLWithPath:[VCamConfig sharedConfig].videoFile];
         _videoAsset = [AVAsset assetWithURL:videoURL];
-        vcam_logf(@"Carregando vídeo do caminho: %@", g_videoFile);
+        vcam_logf(@"Carregando vídeo do caminho: %@", [VCamConfig sharedConfig].videoFile);
         
         if (!_videoAsset) {
             vcam_log(@"Falha ao criar asset para o vídeo");
@@ -236,7 +327,7 @@ static NSString *const g_videoFile = @"/tmp/default.mp4";
         }
         
         // Verificamos se existe um arquivo de vídeo para substituição
-        if (![g_fileManager fileExistsAtPath:g_videoFile]) {
+        if (![g_fileManager fileExistsAtPath:[VCamConfig sharedConfig].videoFile]) {
             vcam_log(@"Arquivo de vídeo para substituição não encontrado, retornando NULL");
             result = nil;
             return;
@@ -416,9 +507,122 @@ static NSString *const g_videoFile = @"/tmp/default.mp4";
 @end
 
 
-// Elementos de UI para o tweak
+// Status indicator view
+@interface VCamIndicatorView : UIView
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) CAShapeLayer *iconLayer;
++ (instancetype)sharedIndicator;
+- (void)updateStatus:(BOOL)active;
+- (void)show;
+- (void)hide;
+@end
+
+@implementation VCamIndicatorView
+
++ (instancetype)sharedIndicator {
+    static VCamIndicatorView *indicator = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        indicator = [[self alloc] init];
+    });
+    return indicator;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.frame = CGRectMake(0, 0, 120, 30);
+        self.layer.cornerRadius = 15;
+        self.clipsToBounds = YES;
+        self.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
+        self.alpha = 0;
+        self.userInteractionEnabled = NO;
+        
+        // Add camera icon
+        _iconLayer = [CAShapeLayer layer];
+        _iconLayer.frame = CGRectMake(10, 5, 20, 20);
+        _iconLayer.fillColor = [UIColor redColor].CGColor;
+        
+        // Create camera shape
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        [path moveToPoint:CGPointMake(4, 7)];
+        [path addLineToPoint:CGPointMake(16, 7)];
+        [path addLineToPoint:CGPointMake(16, 15)];
+        [path addLineToPoint:CGPointMake(4, 15)];
+        [path closePath];
+        
+        // Add lens circle
+        UIBezierPath *lensPath = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(8, 9, 4, 4)];
+        [path appendPath:lensPath];
+        
+        _iconLayer.path = path.CGPath;
+        [self.layer addSublayer:_iconLayer];
+        
+        // Add status label
+        _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(35, 0, 80, 30)];
+        _statusLabel.font = [UIFont systemFontOfSize:12];
+        _statusLabel.textColor = [UIColor whiteColor];
+        _statusLabel.text = @"VCam Off";
+        [self addSubview:_statusLabel];
+        
+        // Position in top-right corner with safe area adjustment
+        if (@available(iOS 11.0, *)) {
+            UIWindow *window = [GetFrame getKeyWindow];
+            CGFloat topPadding = window.safeAreaInsets.top;
+            self.frame = CGRectMake(window.bounds.size.width - 130, topPadding + 10, 120, 30);
+        } else {
+            UIWindow *window = [GetFrame getKeyWindow];
+            self.frame = CGRectMake(window.bounds.size.width - 130, 20, 120, 30);
+        }
+    }
+    return self;
+}
+
+- (void)updateStatus:(BOOL)active {
+    if (active) {
+        _statusLabel.text = @"VCam On";
+        _iconLayer.fillColor = [UIColor greenColor].CGColor;
+    } else {
+        _statusLabel.text = @"VCam Off";
+        _iconLayer.fillColor = [UIColor redColor].CGColor;
+    }
+}
+
+- (void)show {
+    if (![VCamConfig sharedConfig].showIndicator) {
+        return;
+    }
+    
+    if (![self isDescendantOfView:[GetFrame getKeyWindow]]) {
+        [[GetFrame getKeyWindow] addSubview:self];
+    }
+    
+    [UIView animateWithDuration:0.3 animations:^{
+        self.alpha = 1.0;
+    }];
+    
+    // Auto-hide after 3 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self hide];
+    });
+}
+
+- (void)hide {
+    [UIView animateWithDuration:0.3 animations:^{
+        self.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        if (finished) {
+            [self removeFromSuperview];
+        }
+    }];
+}
+@end
+
+// UI components
 static CALayer *g_maskLayer = nil;
 
+// Group declarations to prevent re-initialization errors
+%group MainHooks
 // Hook na layer de preview da câmera
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer{
@@ -432,7 +636,7 @@ static CALayer *g_maskLayer = nil;
         
         // Ajusta a taxa de frames baseado no dispositivo
         if (@available(iOS 10.0, *)) {
-            displayLink.preferredFramesPerSecond = 30; // 30 FPS para economia de bateria
+            displayLink.preferredFramesPerSecond = [VCamConfig sharedConfig].frameRate; // 30 FPS para economia de bateria
         } else {
             displayLink.frameInterval = 2; // Aproximadamente 30 FPS em dispositivos mais antigos
         }
@@ -449,7 +653,7 @@ static CALayer *g_maskLayer = nil;
         // Máscara preta para cobrir a visualização original
         g_maskLayer = [CALayer new];
         g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
-        g_maskLayer.opacity = 0; // Começa invisível
+        g_maskLayer.opacity = 0; //Começa invisível
         
         [self insertSublayer:g_maskLayer above:layer];
         [self insertSublayer:g_previewLayer above:g_maskLayer];
@@ -474,18 +678,33 @@ static CALayer *g_maskLayer = nil;
     
     NSTimeInterval currentTime = [[NSDate date] timeIntervalSince1970];
     
+    VCamConfig *config = [VCamConfig sharedConfig];
+    
+    // Se VCam desabilitado, esconde as camadas
+    if (!config.enabled) {
+        if (g_maskLayer != nil && g_maskLayer.opacity > 0.0) {
+            g_maskLayer.opacity = MAX(g_maskLayer.opacity - 0.1, 0.0);
+        }
+        if (g_previewLayer != nil && g_previewLayer.opacity > 0.0) {
+            g_previewLayer.opacity = MAX(g_previewLayer.opacity - 0.1, 0.0);
+        }
+        return;
+    }
+    
     // Verifica a existência do arquivo a cada segundo
     if (currentTime - lastFileCheckTime > 1.0) {
-        fileExists = [g_fileManager fileExistsAtPath:g_videoFile];
+        fileExists = [g_fileManager fileExistsAtPath:config.videoFile];
         lastFileCheckTime = currentTime;
     }
     
-    // Controla a visibilidade das camadas baseado na existência do arquivo de vídeo
-    if (fileExists) {
-        // Animação suave para mostrar as camadas, se não estiverem visíveis
-        if (g_maskLayer != nil && g_maskLayer.opacity < 1.0) {
-            g_maskLayer.opacity = MIN(g_maskLayer.opacity + 0.1, 1.0);
+    // Control layer visibility based on video file existence
+    if (fileExists && config.enabled) {
+        // Set black mask to fully opaque immediately
+        if (g_maskLayer != nil) {
+            g_maskLayer.opacity = 1.0; // Instantaneously opaque
         }
+        
+        // Fade in the video layer gradually for smooth transition
         if (g_previewLayer != nil) {
             if (g_previewLayer.opacity < 1.0) {
                 g_previewLayer.opacity = MIN(g_previewLayer.opacity + 0.1, 1.0);
@@ -493,14 +712,14 @@ static CALayer *g_maskLayer = nil;
             [g_previewLayer setVideoGravity:[self videoGravity]];
         }
     } else {
-        // Animação suave para esconder as camadas, se estiverem visíveis
+        // Smooth animation to hide layers if visible
         if (g_maskLayer != nil && g_maskLayer.opacity > 0.0) {
-            g_maskLayer.opacity = MAX(g_maskLayer.opacity - 0.1, 0.0);
+            g_maskLayer.opacity = 0.0; // Instantaneously transparent
         }
         if (g_previewLayer != nil && g_previewLayer.opacity > 0.0) {
             g_previewLayer.opacity = MAX(g_previewLayer.opacity - 0.1, 0.0);
         }
-        return; // Evita processamento adicional se não houver arquivo
+        return; // Avoid additional processing if no file
     }
 
     // Se a câmera está ativa e a camada de preview existe
@@ -574,6 +793,15 @@ static CALayer *g_maskLayer = nil;
     g_cameraRunning = YES;
     g_bufferReload = YES;
     g_refreshPreviewByVideoDataOutputTime = [[NSDate date] timeIntervalSince1970] * 1000;
+    
+    // Mostrar o indicador se o VCam estiver habilitado
+    if ([VCamConfig sharedConfig].enabled) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[VCamIndicatorView sharedIndicator] updateStatus:YES];
+            [[VCamIndicatorView sharedIndicator] show];
+        });
+    }
+    
     vcam_logf(@"AVCaptureSession iniciada com preset: %@", [self sessionPreset]);
     %orig;
 }
@@ -646,19 +874,28 @@ static CALayer *g_maskLayer = nil;
                 // Armazena a orientação atual do vídeo
                 g_photoOrientation = [connection videoOrientation];
                 
-                // Verifica se o arquivo de vídeo existe antes de tentar substituir
-                if ([g_fileManager fileExistsAtPath:g_videoFile]) {
-                    // Obtém um frame do vídeo para substituir o buffer
-                    CMSampleBufferRef newBuffer = [[GetFrame sharedInstance] getCurrentFrame:sampleBuffer forceReNew:NO];
-                    
-                    // Atualiza o preview usando o buffer
-                    if (newBuffer != nil && g_previewLayer != nil && g_previewLayer.readyForMoreMediaData) {
-                        [g_previewLayer flush];
-                        [g_previewLayer enqueueSampleBuffer:newBuffer];
+                // Verifica se o VCam está habilitado
+                VCamConfig *config = [VCamConfig sharedConfig];
+                if (config.enabled) {
+                    vcam_log(@"VCam está habilitado, verificando arquivo de vídeo");
+                
+                    // Verifica se o arquivo de vídeo existe antes de tentar substituir
+                    if ([g_fileManager fileExistsAtPath:config.videoFile]) {
+                        vcam_log(@"Arquivo de vídeo encontrado, substituindo buffer");
+                        // Obtém um frame do vídeo para substituir o buffer
+                        CMSampleBufferRef newBuffer = [[GetFrame sharedInstance] getCurrentFrame:sampleBuffer forceReNew:NO];
+                        
+                        // Atualiza o preview usando o buffer
+                        if (newBuffer != nil && g_previewLayer != nil && g_previewLayer.readyForMoreMediaData) {
+                            [g_previewLayer flush];
+                            [g_previewLayer enqueueSampleBuffer:newBuffer];
+                        }
+                        
+                        // Chama o método original com o buffer substituído
+                        return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer != nil ? newBuffer : sampleBuffer, connection);
+                    } else {
+                        vcam_log(@"Arquivo de vídeo não encontrado, usando buffer original");
                     }
-                    
-                    // Chama o método original com o buffer substituído
-                    return original_method(self, @selector(captureOutput:didOutputSampleBuffer:fromConnection:), output, newBuffer != nil ? newBuffer : sampleBuffer, connection);
                 }
                 
                 // Se não há vídeo para substituir, usa o buffer original
@@ -671,11 +908,15 @@ static CALayer *g_maskLayer = nil;
     %orig;
 }
 %end
+%end // End of MainHooks group
 
-// Variáveis para controle da interface de usuário
+// Variables for UI control
 static NSTimeInterval g_volume_up_time = 0;
 static NSTimeInterval g_volume_down_time = 0;
+static NSTimeInterval g_last_toggle_time = 0;
 
+// Separate group for volume control hooks
+%group VolumeHooks
 // Hook para os controles de volume
 %hook VolumeControl
 // Método chamado quando volume é aumentado
@@ -695,97 +936,121 @@ static NSTimeInterval g_volume_down_time = 0;
     
     // Verifica se o botão de aumentar volume foi pressionado recentemente (menos de 1 segundo)
     if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1) {
+        // Prevenir múltiplos disparos em sequência
+        if (nowtime - g_last_toggle_time < 1.0) {
+            return %orig;
+        }
+        
+        g_last_toggle_time = nowtime;
         vcam_log(@"Sequência volume-up + volume-down detectada, abrindo menu");
 
         // Verifica se o arquivo de vídeo existe
-        BOOL videoActive = [g_fileManager fileExistsAtPath:g_videoFile];
+        VCamConfig *config = [VCamConfig sharedConfig];
+        BOOL videoActive = [g_fileManager fileExistsAtPath:config.videoFile];
         
         // Cria alerta para mostrar status e opções
-        NSString *title = videoActive ? @"iOS-VCAM ✅" : @"iOS-VCAM";
+        NSString *title = config.enabled ? @"iOS-VCAM ✅" : @"iOS-VCAM";
         NSString *message = videoActive ?
-            @"A substituição do feed da câmera está ativa." :
-            @"A substituição do feed da câmera está desativada.";
+            (config.enabled ? @"A substituição do feed da câmera está ativa." : @"A substituição do feed da câmera está pronta, mas desativada.") :
+            @"Arquivo de vídeo não encontrado. Adicione um vídeo para usar.";
         
         UIAlertController *alertController = [UIAlertController
             alertControllerWithTitle:title
             message:message
             preferredStyle:UIAlertControllerStyleAlert];
         
-        // Opção para desativar substituição (só aparece se estiver ativo)
-        if (videoActive) {
-            UIAlertAction *disableAction = [UIAlertAction
-                actionWithTitle:@"Desativar substituição"
-                style:UIAlertActionStyleDestructive
-                handler:^(UIAlertAction *action) {
-                    vcam_log(@"Opção 'Desativar substituição' escolhida");
-                    
-                    // Força a liberação de recursos antes de tentar remover o arquivo
-                    g_bufferReload = YES;
-                    g_canReleaseBuffer = YES;
-                    
-                    // Libera referências ao vídeo
-                    [[GetFrame sharedInstance] performSelector:@selector(releaseResources)];
-                    
-                    // Tenta remover o arquivo com várias abordagens para garantir que funcione
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        vcam_log(@"Tentando remover arquivo de vídeo");
-                        
-                        // Primeira tentativa - método padrão
-                        NSError *error = nil;
-                        BOOL success = [g_fileManager removeItemAtPath:g_videoFile error:&error];
-                        
-                        if (!success) {
-                            vcam_logf(@"Primeira tentativa falhou: %@", error);
+        // Opção para togglear substituição
+        NSString *toggleTitle = config.enabled ? @"Desativar substituição" : @"Ativar substituição";
+        UIAlertAction *toggleAction = [UIAlertAction
+            actionWithTitle:toggleTitle
+            style:config.enabled ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+                BOOL newState = [config toggleEnabled];
+                vcam_logf(@"VCam %@ by user", newState ? @"enabled" : @"disabled");
+                
+                if (newState) {
+                    // Mostrar indicador com status atualizado
+                    [[VCamIndicatorView sharedIndicator] updateStatus:YES];
+                    [[VCamIndicatorView sharedIndicator] show];
+                } else {
+                    // Mostrar indicador com status atualizado
+                    [[VCamIndicatorView sharedIndicator] updateStatus:NO];
+                    [[VCamIndicatorView sharedIndicator] show];
+                }
+            }];
+        [alertController addAction:toggleAction];
+        
+        // Opção para alterar taxa de frames
+        UIAlertAction *framerateAction = [UIAlertAction
+            actionWithTitle:@"Alterar Taxa de Frames"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+                // Create frame rate selection alert
+                UIAlertController *framerateAlert = [UIAlertController
+                    alertControllerWithTitle:@"Selecione a Taxa de Frames"
+                    message:@"Taxas mais altas consomem mais bateria."
+                    preferredStyle:UIAlertControllerStyleAlert];
+                
+                // Add options for different frame rates
+                NSArray *frameRates = @[@15, @24, @30, @60];
+                for (NSNumber *rate in frameRates) {
+                    NSString *title = [NSString stringWithFormat:@"%@ FPS", rate];
+                    UIAlertAction *rateAction = [UIAlertAction
+                        actionWithTitle:title
+                        style:UIAlertActionStyleDefault
+                        handler:^(UIAlertAction *action) {
+                            config.frameRate = [rate intValue];
+                            [config saveConfig];
+                            vcam_logf(@"Frame rate set to %d FPS", [rate intValue]);
                             
-                            // Segunda tentativa - usando funções POSIX
-                            int result = unlink([g_videoFile UTF8String]);
-                            if (result != 0) {
-                                vcam_logf(@"Segunda tentativa falhou com erro: %d", errno);
+                            // Inform user about restart requirement
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                UIAlertController *infoAlert = [UIAlertController
+                                    alertControllerWithTitle:@"Taxa de Frames Atualizada"
+                                    message:@"Para que esta mudança tenha efeito completo, feche e reabra o aplicativo da câmera."
+                                    preferredStyle:UIAlertControllerStyleAlert];
                                 
-                                // Terceira tentativa - criar arquivo vazio para sobrescrever
-                                [@"" writeToFile:g_videoFile atomically:YES encoding:NSUTF8StringEncoding error:&error];
-                                [g_fileManager removeItemAtPath:g_videoFile error:nil];
-                            }
-                        }
-                        
-                        // Verifica se a remoção foi bem-sucedida
-                        if (![g_fileManager fileExistsAtPath:g_videoFile]) {
-                            vcam_log(@"Arquivo de vídeo removido com sucesso");
-                            
-                            // Avisa o usuário que o vídeo foi desativado
-                            UIAlertController *successAlert = [UIAlertController
-                                alertControllerWithTitle:@"Sucesso"
-                                message:@"A substituição do feed da câmera foi desativada."
-                                preferredStyle:UIAlertControllerStyleAlert];
-                            
-                            UIAlertAction *okAction = [UIAlertAction
-                                actionWithTitle:@"OK"
-                                style:UIAlertActionStyleDefault
-                                handler:nil];
-                            
-                            [successAlert addAction:okAction];
-                            [[GetFrame getKeyWindow].rootViewController presentViewController:successAlert animated:YES completion:nil];
-                        } else {
-                            vcam_log(@"Falha ao remover arquivo de vídeo");
-                            
-                            // Informa o usuário sobre a falha
-                            UIAlertController *failureAlert = [UIAlertController
-                                alertControllerWithTitle:@"Erro"
-                                message:@"Não foi possível desativar a substituição do feed da câmera. Tente novamente."
-                                preferredStyle:UIAlertControllerStyleAlert];
-                            
-                            UIAlertAction *okAction = [UIAlertAction
-                                actionWithTitle:@"OK"
-                                style:UIAlertActionStyleDefault
-                                handler:nil];
-                            
-                            [failureAlert addAction:okAction];
-                            [[GetFrame getKeyWindow].rootViewController presentViewController:failureAlert animated:YES completion:nil];
-                        }
-                    });
-                }];
-            [alertController addAction:disableAction];
-        }
+                                UIAlertAction *okAction = [UIAlertAction
+                                    actionWithTitle:@"OK"
+                                    style:UIAlertActionStyleDefault
+                                    handler:nil];
+                                
+                                [infoAlert addAction:okAction];
+                                [[GetFrame getKeyWindow].rootViewController
+                                    presentViewController:infoAlert animated:YES completion:nil];
+                            });
+                        }];
+                    [framerateAlert addAction:rateAction];
+                }
+                
+                // Add cancel option
+                UIAlertAction *cancelAction = [UIAlertAction
+                    actionWithTitle:@"Cancelar"
+                    style:UIAlertActionStyleCancel
+                    handler:nil];
+                [framerateAlert addAction:cancelAction];
+                
+                // Present frame rate selection
+                [[GetFrame getKeyWindow].rootViewController presentViewController:framerateAlert animated:YES completion:nil];
+            }];
+        [alertController addAction:framerateAction];
+        
+        // Opção para togglear indicador
+        NSString *indicatorTitle = config.showIndicator ? @"Esconder Indicador" : @"Mostrar Indicador";
+        UIAlertAction *indicatorAction = [UIAlertAction
+            actionWithTitle:indicatorTitle
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+                config.showIndicator = !config.showIndicator;
+                [config saveConfig];
+                vcam_logf(@"Status indicator %@", config.showIndicator ? @"enabled" : @"disabled");
+                
+                if (config.showIndicator) {
+                    [[VCamIndicatorView sharedIndicator] updateStatus:config.enabled];
+                    [[VCamIndicatorView sharedIndicator] show];
+                }
+            }];
+        [alertController addAction:indicatorAction];
         
         // Opção para informações de status
         UIAlertAction *statusAction = [UIAlertAction
@@ -796,16 +1061,26 @@ static NSTimeInterval g_volume_down_time = 0;
                 
                 // Coleta informações de status
                 NSString *statusInfo = [NSString stringWithFormat:
-                    @"Arquivo de vídeo: %@\n"
-                    @"Câmera ativa: %@\n"
-                    @"Posição da câmera: %@\n"
-                    @"Orientação: %d\n"
-                    @"Aplicativo atual: %@",
-                    [g_fileManager fileExistsAtPath:g_videoFile] ? @"Presente" : @"Ausente",
+                    @"• VCam habilitado: %@\n"
+                    @"• Arquivo de vídeo: %@\n"
+                    @"• Câmera ativa: %@\n"
+                    @"• Posição da câmera: %@\n"
+                    @"• Orientação: %@\n"
+                    @"• Taxa de frames: %d FPS\n"
+                    @"• Indicador de status: %@\n"
+                    @"• Aplicativo atual: %@\n"
+                    @"• Versão iOS: %@",
+                    config.enabled ? @"Sim" : @"Não",
+                    videoActive ? @"Encontrado" : @"Ausente",
                     g_cameraRunning ? @"Sim" : @"Não",
-                    g_cameraPosition,
-                    (int)g_photoOrientation,
-                    [NSProcessInfo processInfo].processName
+                    [g_cameraPosition isEqualToString:@"F"] ? @"Frontal" : @"Traseira",
+                    g_photoOrientation == AVCaptureVideoOrientationPortrait ? @"Retrato" :
+                    (g_photoOrientation == AVCaptureVideoOrientationLandscapeLeft ? @"Paisagem Esquerda" :
+                     (g_photoOrientation == AVCaptureVideoOrientationLandscapeRight ? @"Paisagem Direita" : @"Retrato Invertido")),
+                    config.frameRate,
+                    config.showIndicator ? @"Visível" : @"Oculto",
+                    [NSProcessInfo processInfo].processName,
+                    [[UIDevice currentDevice] systemVersion]
                 ];
                 
                 UIAlertController *statusAlert = [UIAlertController
@@ -822,6 +1097,32 @@ static NSTimeInterval g_volume_down_time = 0;
                 [[GetFrame getKeyWindow].rootViewController presentViewController:statusAlert animated:YES completion:nil];
             }];
         
+        // Add help option
+        UIAlertAction *helpAction = [UIAlertAction
+            actionWithTitle:@"Ajuda"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+                NSString *helpText =
+                    @"iOS-VCAM permite substituir o feed da câmera por um arquivo de vídeo.\n\n"
+                    @"• Para usar, coloque um arquivo de vídeo em:\n/tmp/default.mp4\n\n"
+                    @"• Ative o VCam pressionando volume-up + volume-down rapidamente\n\n"
+                    @"• Versões futuras suportarão streaming de outros dispositivos\n\n"
+                    @"• Para melhores resultados, use vídeo que corresponda à proporção da tela do seu dispositivo";
+                
+                UIAlertController *helpAlert = [UIAlertController
+                    alertControllerWithTitle:@"Ajuda do VCam"
+                    message:helpText
+                    preferredStyle:UIAlertControllerStyleAlert];
+                
+                UIAlertAction *okAction = [UIAlertAction
+                    actionWithTitle:@"OK"
+                    style:UIAlertActionStyleDefault
+                    handler:nil];
+                
+                [helpAlert addAction:okAction];
+                [[GetFrame getKeyWindow].rootViewController presentViewController:helpAlert animated:YES completion:nil];
+            }];
+        
         // Opção para cancelar
         UIAlertAction *cancelAction = [UIAlertAction
             actionWithTitle:@"Fechar"
@@ -830,6 +1131,7 @@ static NSTimeInterval g_volume_down_time = 0;
         
         // Adiciona as ações ao alerta
         [alertController addAction:statusAction];
+        [alertController addAction:helpAction];
         [alertController addAction:cancelAction];
         
         // Apresenta o alerta
@@ -843,25 +1145,44 @@ static NSTimeInterval g_volume_down_time = 0;
     %orig;
 }
 %end
+%end // End of VolumeHooks group
 
 // Função chamada quando o tweak é carregado
 %ctor {
     vcam_log(@"--------------------------------------------------");
     vcam_log(@"VCamTeste - Inicializando tweak");
     
-    // Inicializa hooks específicos para versões do iOS
-    if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){13, 0, 0}]) {
-        vcam_log(@"Detectado iOS 13 ou superior, inicializando hooks para VolumeControl");
-        %init(VolumeControl = NSClassFromString(@"SBVolumeControl"));
-    }
-    
-    // Inicializa recursos globais
-    vcam_log(@"Inicializando recursos globais");
+    // Initialize global resources
+    vcam_log(@"Initializing global resources");
     g_fileManager = [NSFileManager defaultManager];
     
-    vcam_logf(@"Processo atual: %@", [NSProcessInfo processInfo].processName);
+    // Load configuration
+    [[VCamConfig sharedConfig] loadConfig];
+    
+    // Initialize hooks specific to iOS versions
+    %init(MainHooks);
+    
+    // iOS version specific initialization - Only initialize VolumeHooks once
+    Class volumeControlClass = nil;
+    if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){13, 0, 0}]) {
+        vcam_log(@"Detected iOS 13 or higher, using SBVolumeControl");
+        volumeControlClass = NSClassFromString(@"SBVolumeControl");
+    } else {
+        vcam_log(@"Detected iOS 12 or lower, using VolumeControl");
+        volumeControlClass = objc_getClass("VolumeControl");
+    }
+    
+    // Initialize volume hooks only if we found the class
+    if (volumeControlClass) {
+        vcam_log(@"Initializing VolumeHooks");
+        %init(VolumeHooks, VolumeControl = volumeControlClass);
+    } else {
+        vcam_log(@"Warning: VolumeControl class not found");
+    }
+    
+    vcam_logf(@"Current process: %@", [NSProcessInfo processInfo].processName);
     vcam_logf(@"Bundle ID: %@", [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleIdentifier"]);
-    vcam_log(@"Tweak inicializado com sucesso");
+    vcam_log(@"Tweak initialized successfully");
 }
 
 // Função chamada quando o tweak é descarregado
@@ -875,6 +1196,9 @@ static NSTimeInterval g_volume_down_time = 0;
     g_previewLayer = nil;
     g_refreshPreviewByVideoDataOutputTime = 0;
     g_cameraRunning = NO;
+    
+    // Save configuration
+    [[VCamConfig sharedConfig] saveConfig];
     
     vcam_log(@"Tweak finalizado com sucesso");
     vcam_log(@"--------------------------------------------------");
